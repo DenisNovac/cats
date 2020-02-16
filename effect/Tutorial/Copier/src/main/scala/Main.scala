@@ -1,8 +1,8 @@
-import cats.effect.{IO, Resource}
+import cats.effect.{Concurrent, ExitCode, IO, IOApp, Resource}
 import cats.implicits._
 import java.io._
 
-import javax.lang.model.util.Elements.Origin
+import cats.effect.concurrent.Semaphore
 
 object Copier {
   /**
@@ -23,10 +23,14 @@ object Copier {
    * @param destination Место назначения
    * @return Количество скопированных байт
    */
-  def copy(origin: File, destination: File): IO[Long] =
-    inputOutputStreams(origin, destination).use { case (in, out) =>
-      transfer(in, out)
-    }
+  def copy(origin: File, destination: File)(implicit concurrent: Concurrent[IO]): IO[Long] =
+    for {
+      guard <- Semaphore[IO](1)
+      count <- inputOutputStreams(origin, destination, guard).use { case (in, out) =>
+                  guard.withPermit(transfer(in, out))
+               }
+    } yield count
+
 
   /**
    * Метод будет совершать настоящее копирование, когда потоки будут получены. Каким бы ни был результат transfer -
@@ -74,10 +78,10 @@ object Copier {
    * Вызов inputOutputStreams считается успешным только если оба ресурса внутри были созданы успешно. Так работает
    * обёртка Resource.
    */
-  def inputOutputStreams(in: File, out: File): Resource[IO, (InputStream, OutputStream)] =
+  def inputOutputStreams(in: File, out: File, guard: Semaphore[IO]): Resource[IO, (InputStream, OutputStream)] =
     for {
-      inStream <- inputStream(in)
-      outStream <- outputStream(out)
+      inStream <- inputStream(in, guard)
+      outStream <- outputStream(out, guard)
     } yield (inStream, outStream)
 
   /**
@@ -91,18 +95,23 @@ object Copier {
    * Ещё при использовании Resource мы можем сами обрабатывать ошибки через .handleErrorWith.
    */
 
-  def inputStream(f: File): Resource[IO, FileInputStream] =
+  def inputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileInputStream] =
     Resource.make {
       IO(new FileInputStream(f))  // получение ресурса
     } { inStream =>
-      IO(inStream.close()).handleErrorWith(_ => IO.unit)  // освобождение
+      guard.withPermit {
+        IO(inStream.close()).handleErrorWith(_ => IO.unit)  // освобождение
+      }
     }
 
-  def outputStream(f: File): Resource[IO, FileOutputStream] =
+  def outputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileOutputStream] =
     Resource.make {
       IO(new FileOutputStream(f))  // получение ресурса
     } { outStream =>
-      IO(outStream.close()).handleErrorWith(_ => IO.unit)  // освобождение ресурса
+      guard.withPermit {
+        IO(outStream.close()).handleErrorWith(_ => IO.unit)  // освобождение ресурса
+      }
+
     }
 
   /**
@@ -114,21 +123,16 @@ object Copier {
 }
 
 
-object Main {
-  def main(args: Array[String]): Unit = {
-    val origin: String = args(0)
-    val dest: String = args(1)
+object Main extends IOApp{
 
-    val copied: IO[Long] = Copier.copy(new File(origin), new File(dest))
+  override def run(args: List[String]): IO[ExitCode] =
+    for {
+      _ <- if(args.length < 2) IO.raiseError(new IllegalArgumentException("Аргументы: Источник Назначение"))
+           else IO.unit
+      orig = new File(args(0))
+      dest = new File(args(1))
+      count <- Copier.copy(orig, dest)
+      _ <- IO(println(s"Count: $count"))
 
-    try {
-      copied.unsafeRunSync()
-    } catch {
-      case e: FileNotFoundException => println(e)
-    }
-
-
-  }
-
-
+    } yield ExitCode.Success
 }
